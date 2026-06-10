@@ -1,0 +1,18 @@
+name: ntua_slp_project
+channels:
+  - conda-forge
+dependencies:
+  - notebook
+  - jupyterlab
+  - ipywidgets
+  - tqdm
+  - numpy
+  - scikit-learn
+  - pandas
+  - matplotlib
+  - seaborn
+  - transformers
+  - pip
+  - pip:
+      - torch
+      - torchaudio
