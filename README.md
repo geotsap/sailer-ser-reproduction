@@ -1,3 +1,3 @@
 # SAILER Implementation
 
-SLP semester project for about SAILER
+SLP semester project for NTUA about SAILER framework
