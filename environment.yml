@@ -12,6 +12,7 @@ dependencies:
   - matplotlib
   - seaborn
   - transformers
+  - nbstripout
   - pip
   - pip:
       - torch

@@ -1,2 +1,10 @@
+.ipynb_checkpoints/
+*.pt
+*.pth
+*.ckpt
+
 # Data
 data/
+
+# Outputs
+outputs/

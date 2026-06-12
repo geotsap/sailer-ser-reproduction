@@ -1,8 +1,5 @@
 """Compact SER models that consume cached Whisper and RoBERTa hidden states.
 
-Place this file at:
-    src/model/emotion_models.py
-
 Design assumptions:
     - Whisper and RoBERTa are frozen and are NOT run inside these models.
     - Feature extraction is done offline and all hidden states are saved to disk.
