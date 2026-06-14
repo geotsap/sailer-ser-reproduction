@@ -13,7 +13,9 @@ dependencies:
   - seaborn
   - transformers
   - nbstripout
+  - ffmpeg
   - pip
   - pip:
       - torch
       - torchaudio
+      - torchcodec
