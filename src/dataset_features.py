@@ -21,9 +21,8 @@ hidden states από το disk — πολύ πιο γρήγορο για trainin
         hf_dataset_path = "/content/drive/MyDrive/SLP/msp_podcast_hf",
         feature_dirs     = {
             "whisper": "/content/drive/MyDrive/SLP/features/whisper-large-v3",
-            "wavlm":   "/content/drive/MyDrive/SLP/features/wavlm-large",  # προαιρετικό
         },
-        split            = "train",
+        split = "train",
     )
 
     loader = DataLoader(ds, batch_size=32, shuffle=True,
@@ -43,19 +42,53 @@ from torch.utils.data import Dataset
 
 
 # ---------------------------------------------------------------------------
-# Constants — πρέπει να ταιριάζουν με τα extracted features
+# Constants
 # ---------------------------------------------------------------------------
 
+# Τα 9 SAILER primary emotion classes (σταθερή σειρά — δεν αλλάζει)
 PRIMARY_LABELS: List[str] = [
     "Angry", "Sad", "Happy", "Surprise",
     "Fear", "Disgust", "Contempt", "Neutral", "Other",
 ]
 
-# Τα emotion label columns στο HuggingFace dataset
-EMOTION_COLS: List[str] = [
-    "anger", "sadness", "happiness", "surprise",
-    "fear", "disgust", "contempt", "neutral", "other",
+# Columns του HF dataset που αντιστοιχούν 1-1 στα primary labels
+# "other" υπολογίζεται ως άθροισμα των υπόλοιπων secondary columns
+PRIMARY_COLS: List[str] = [
+    "angry", "sad", "happy", "surprise",
+    "fear", "disgust", "contempt", "neutral",
 ]
+
+# Secondary columns που αθροίζονται στο "Other" bucket
+OTHER_COLS: List[str] = [
+    "frustrated", "annoyed", "disappointed",
+    "depressed", "confused", "concerned",
+    "amused", "excited",
+]
+
+# Mapping από major_emotion string → index στο PRIMARY_LABELS
+# Όλα τα secondary emotions που δεν είναι primary → Other (index 8)
+MAJOR_EMOTION_TO_IDX: Dict[str, int] = {
+    "angry":        0,
+    "sad":          1,
+    "happy":        2,
+    "surprise":     3,
+    "fear":         4,
+    "disgust":      5,
+    "contempt":     6,
+    "neutral":      7,
+    # secondary → Other
+    "frustrated":   8,
+    "annoyed":      8,
+    "disappointed": 8,
+    "depressed":    8,
+    "confused":     8,
+    "concerned":    8,
+    "amused":       8,
+    "excited":      8,
+}
+
+# Για συμβατότητα με train_whisper.py
+EMOTION_COLS: List[str] = PRIMARY_LABELS
 
 
 # ---------------------------------------------------------------------------
@@ -71,19 +104,20 @@ class FeatureDataset(Dataset):
     feature_dirs : dict[str, str | Path]
         Mapping από encoder name σε directory με .npy files.
         Π.χ. {"whisper": "/path/to/whisper-large-v3"}
-        Υποστηριζόμενα keys: "whisper", "wavlm"
         Τουλάχιστον ένα key είναι υποχρεωτικό.
     split : str
         Ποιο split να φορτώσει: "train", "validation", "test".
-        Αν το dataset έχει μόνο "train" split (όπως το HF dataset),
-        κάνει manual split με fixed seed.
+        Το HF dataset έχει μόνο "train" split — γίνεται manual split
+        με fixed seed για reproducibility.
     train_ratio : float
-        Ποσοστό για train όταν γίνεται manual split.
+        Ποσοστό για train (default 0.8).
     val_ratio : float
-        Ποσοστό για validation όταν γίνεται manual split.
+        Ποσοστό για validation (default 0.1). Το test παίρνει τα υπόλοιπα.
     skip_missing : bool
         Αν True, παραλείπει utterances που δεν έχουν .npy file.
         Αν False, κάνει raise FileNotFoundError.
+    seed : int
+        Seed για το random split (default 42).
     """
 
     def __init__(
@@ -94,25 +128,29 @@ class FeatureDataset(Dataset):
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         skip_missing: bool = True,
+        seed: int = 42,
     ) -> None:
         if not feature_dirs:
             raise ValueError("Πρέπει να δώσεις τουλάχιστον ένα feature_dir.")
 
         self.feature_dirs = {k: Path(v) for k, v in feature_dirs.items()}
         self.split        = split
+        self.emotion_cols = PRIMARY_LABELS   # για συμβατότητα με train_whisper.py
 
-        # ── Φόρτωσε το HuggingFace dataset ──────────────────────────────────
+        # ── Φόρτωσε το HuggingFace dataset (χωρίς audio για ταχύτητα) ───────
         print(f"[FeatureDataset] Φόρτωση dataset από {hf_dataset_path} ...")
         ds = load_from_disk(str(hf_dataset_path))
         if hasattr(ds, "keys"):
-            ds = ds["train"]   # το HF dataset έχει μόνο train split
+            ds = ds["train"]
 
-        # ── Manual train/val/test split ──────────────────────────────────────
-        total     = len(ds)
-        indices   = list(range(total))
+        # Αφαίρεσε το audio column — δεν το χρειαζόμαστε, εξοικονομεί RAM
+        if "audio" in ds.column_names:
+            ds = ds.remove_columns(["audio"])
 
-        # Reproducible shuffle με fixed seed
-        rng = np.random.default_rng(seed=42)
+        # ── Manual train/val/test split με fixed seed ────────────────────────
+        total   = len(ds)
+        indices = list(range(total))
+        rng     = np.random.default_rng(seed=seed)
         rng.shuffle(indices)
 
         n_train = int(total * train_ratio)
@@ -135,8 +173,7 @@ class FeatureDataset(Dataset):
         missing       = 0
 
         for i in range(len(ds)):
-            file_name = ds[i]["file"]
-            utt_id    = Path(file_name).stem
+            utt_id    = Path(ds[i]["file"]).stem
             all_exist = all(
                 (feat_dir / f"{utt_id}.npy").exists()
                 for feat_dir in self.feature_dirs.values()
@@ -146,9 +183,7 @@ class FeatureDataset(Dataset):
             else:
                 missing += 1
                 if not skip_missing:
-                    raise FileNotFoundError(
-                        f"Missing .npy για utterance: {utt_id}"
-                    )
+                    raise FileNotFoundError(f"Missing .npy για utterance: {utt_id}")
 
         if missing > 0:
             print(f"[FeatureDataset] Παραλείφθηκαν {missing} utterances χωρίς features.")
@@ -156,41 +191,47 @@ class FeatureDataset(Dataset):
         self.ds = ds.select(valid_indices)
         print(f"[FeatureDataset] Τελικό μέγεθος: {len(self.ds)} utterances")
 
-        # ── Pre-compute soft labels ──────────────────────────────────────────
-        # Ελέγχουμε ποιες emotion columns υπάρχουν στο dataset
-        available_cols = [c for c in EMOTION_COLS if c in self.ds.features]
-        if not available_cols:
-            raise ValueError(
-                f"Δεν βρέθηκαν emotion columns. "
-                f"Διαθέσιμες columns: {list(self.ds.features.keys())}"
-            )
-        self.emotion_cols = available_cols
-        print(f"[FeatureDataset] Emotion columns: {self.emotion_cols}")
-
-    # ── Internal helpers ─────────────────────────────────────────────────────
-
-    def _load_features(self, utt_id: str) -> Dict[str, Tensor]:
-        """Φόρτωσε τα .npy features για ένα utterance."""
-        features = {}
-        for encoder_name, feat_dir in self.feature_dirs.items():
-            arr = np.load(str(feat_dir / f"{utt_id}.npy"))   # [T, D]
-            features[encoder_name] = torch.from_numpy(arr)    # Tensor [T, D]
-        return features
+    # ── Soft label από τα emotion columns ────────────────────────────────────
 
     def _get_soft_label(self, sample: dict) -> Tensor:
-        """Εξάγαγε soft label από τις emotion columns."""
-        values = [float(sample.get(col, 0.0) or 0.0) for col in self.emotion_cols]
+        """
+        Υπολογίζει 9-dim soft label distribution από τα HF dataset columns.
+
+        Τα 8 primary columns διαβάζονται απευθείας.
+        Το "Other" είναι το άθροισμα των secondary columns.
+        Στο τέλος κανονικοποιείται σε probability distribution (sum=1).
+        """
+        # Primary values (8 classes)
+        primary_vals = [float(sample.get(col, 0.0) or 0.0) for col in PRIMARY_COLS]
+
+        # Other = άθροισμα secondary columns
+        other_val = sum(float(sample.get(col, 0.0) or 0.0) for col in OTHER_COLS)
+
+        values = primary_vals + [other_val]
         label  = torch.tensor(values, dtype=torch.float32)
 
-        # Κανονικοποίηση σε probability distribution
+        # Κανονικοποίηση
         total = label.sum()
         if total > 0:
             label = label / total
         else:
-            # Αν δεν υπάρχουν annotations, uniform distribution
-            label = torch.ones(len(self.emotion_cols)) / len(self.emotion_cols)
+            label = torch.ones(len(PRIMARY_LABELS)) / len(PRIMARY_LABELS)
 
-        return label
+        return label  # [9]
+
+    def _get_hard_label(self, sample: dict) -> int:
+        """Hard label από το major_emotion column."""
+        major = (sample.get("major_emotion") or "").strip().lower()
+        return MAJOR_EMOTION_TO_IDX.get(major, 8)  # default → Other
+
+    # ── Feature loading ───────────────────────────────────────────────────────
+
+    def _load_features(self, utt_id: str) -> Dict[str, Tensor]:
+        features = {}
+        for encoder_name, feat_dir in self.feature_dirs.items():
+            arr = np.load(str(feat_dir / f"{utt_id}.npy"))  # [T, D]
+            features[encoder_name] = torch.from_numpy(arr)  # Tensor [T, D]
+        return features
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -198,15 +239,16 @@ class FeatureDataset(Dataset):
         return len(self.ds)
 
     def __getitem__(self, idx: int) -> Dict:
-        sample  = self.ds[idx]
-        utt_id  = Path(sample["file"]).stem
+        sample   = self.ds[idx]
+        utt_id   = Path(sample["file"]).stem
         features = self._load_features(utt_id)
-        label    = self._get_soft_label(sample)
+        soft     = self._get_soft_label(sample)
+        hard     = self._get_hard_label(sample)
 
         return {
-            **features,              # "whisper": Tensor [T, 1280], "wavlm": Tensor [T, 1024]
-            "soft_label": label,     # Tensor [num_emotions]
-            "hard_label": int(label.argmax().item()),
+            **features,           # "whisper": Tensor [T, 1280]
+            "soft_label": soft,   # Tensor [9]
+            "hard_label": hard,   # int
             "utt_id":     utt_id,
         }
 
@@ -214,35 +256,35 @@ class FeatureDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch: List[Dict]) -> Dict:
-        """Padding και stacking για το DataLoader.
+        """
+        Padding και stacking για το DataLoader.
 
         Returns
         -------
         dict με keys:
-            <encoder_name>          : Tensor [B, T_max, D]  — zero-padded
-            <encoder_name>_lengths  : Tensor [B]             — αρχικά μήκη
-            soft_labels             : Tensor [B, num_emotions]
-            hard_labels             : Tensor [B]
-            utt_ids                 : List[str]
+            <encoder_name>         : Tensor [B, T_max, D]  — zero-padded
+            <encoder_name>_lengths : Tensor [B]             — αρχικά μήκη σε frames
+            soft_labels            : Tensor [B, 9]
+            hard_labels            : Tensor [B]
+            utt_ids                : List[str]
         """
         output: Dict = {}
 
-        # Βρες ποιοι encoders υπάρχουν στο batch
         encoder_keys = [k for k in batch[0].keys()
                         if k not in ("soft_label", "hard_label", "utt_id")]
 
         for key in encoder_keys:
-            tensors = [item[key] for item in batch]          # List of [T, D]
+            tensors = [item[key] for item in batch]
             lengths = torch.tensor([t.shape[0] for t in tensors], dtype=torch.long)
-            max_len = lengths.max().item()
+            max_len = int(lengths.max().item())
             D       = tensors[0].shape[1]
 
             padded = torch.zeros(len(tensors), max_len, D)
             for i, t in enumerate(tensors):
                 padded[i, : t.shape[0], :] = t
 
-            output[key]                  = padded            # [B, T_max, D]
-            output[f"{key}_lengths"]     = lengths           # [B]
+            output[key]              = padded   # [B, T_max, D]
+            output[f"{key}_lengths"] = lengths  # [B]
 
         output["soft_labels"] = torch.stack([item["soft_label"] for item in batch])
         output["hard_labels"] = torch.tensor([item["hard_label"] for item in batch])
