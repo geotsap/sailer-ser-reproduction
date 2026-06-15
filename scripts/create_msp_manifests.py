@@ -8,7 +8,8 @@ Expected default raw layout:
     ├── Audio/
     ├── Labels.txt        # or labels.txt
     ├── Partitions.txt    # or Partition.txt / partitions.txt
-    └── Speaker_ids.txt   # optional
+    ├── Speaker_ids.txt   # optional
+    └── Transcripts.txt   # optional, created from the HF transcript source
 
 Outputs:
 
@@ -392,15 +393,54 @@ def parse_speaker_file(speaker_path: Optional[Path]) -> Tuple[Dict[str, str], Di
     return filename_to_speaker, speaker_meta
 
 
+def clean_transcript(text: str) -> str:
+    """Normalize transcript text to a single manifest-safe line."""
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_transcripts_file(transcripts_path: Optional[Path]) -> Dict[str, str]:
+    """Parse Transcripts.txt as `filename; transcript`.
+
+    The parser only splits on the first semicolon so transcripts may contain
+    semicolons without corrupting the filename field. Blank lines and # comments
+    are ignored.
+    """
+    if transcripts_path is None or not transcripts_path.exists():
+        return {}
+
+    transcript_map: Dict[str, str] = {}
+    with transcripts_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ";" not in line:
+                print(
+                    f"Warning: skipping malformed transcript line {line_number}: {raw_line!r}",
+                    file=sys.stderr,
+                )
+                continue
+            filename, transcript = line.split(";", 1)
+            filename = filename.strip()
+            transcript = clean_transcript(transcript)
+            if filename:
+                transcript_map[filename] = transcript
+
+    return transcript_map
+
+
 def build_manifest_rows(
     label_records: Dict[str, Dict[str, Any]],
     partition_map: Dict[str, str],
     filename_to_speaker: Dict[str, str],
     speaker_meta: Dict[str, Dict[str, str]],
     audio_dir: Path,
+    transcript_map: Optional[Dict[str, str]] = None,
     strict_audio: bool = False,
 ) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
+    transcript_map = transcript_map or {}
 
     for filename in sorted(label_records.keys()):
         record = label_records[filename]
@@ -412,10 +452,14 @@ def build_manifest_rows(
 
         speaker_id = filename_to_speaker.get(filename, "")
         gender = speaker_meta.get(speaker_id, {}).get("gender", "") if speaker_id else ""
+        transcript = transcript_map.get(filename, "")
 
         row: Dict[str, str] = {
             "utt_id": Path(filename).stem,
             "filename": filename,
+            "transcript": transcript,
+            "has_transcript": str(bool(transcript)),
+            "transcript_num_chars": str(len(transcript)),
             "audio_path": str(audio_path),
             "audio_exists": str(audio_exists),
             "split": split,
@@ -460,6 +504,9 @@ def get_fieldnames() -> List[str]:
     base_fields = [
         "utt_id",
         "filename",
+        "transcript",
+        "has_transcript",
+        "transcript_num_chars",
         "audio_path",
         "audio_exists",
         "split",
@@ -507,7 +554,13 @@ def write_csv(path: Path, rows: List[Dict[str, str]], fieldnames: List[str]) -> 
         writer.writerows(rows)
 
 
-def write_schema(path: Path, labels_path: Path, partitions_path: Path, speaker_path: Optional[Path]) -> None:
+def write_schema(
+    path: Path,
+    labels_path: Path,
+    partitions_path: Path,
+    speaker_path: Optional[Path],
+    transcripts_path: Optional[Path],
+) -> None:
     schema = {
         "primary_labels": PRIMARY_LABELS,
         "secondary_labels": SECONDARY_LABELS,
@@ -518,11 +571,13 @@ def write_schema(path: Path, labels_path: Path, partitions_path: Path, speaker_p
             "labels": str(labels_path),
             "partitions": str(partitions_path),
             "speaker_ids": str(speaker_path) if speaker_path is not None else None,
+            "transcripts": str(transcripts_path) if transcripts_path is not None else None,
         },
         "notes": [
             "Primary target_* columns are normalized individual primary annotation counts.",
             "Secondary_rate_* columns are multi-label rates: count(label) / num_annotations.",
             "Consensus code X is retained as No Agreement; its primary target distribution is still computed from workers.",
+            "Transcript columns come from optional Transcripts.txt and are not used as label sources.",
         ],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -538,6 +593,8 @@ def summarize(rows: List[Dict[str, str]]) -> str:
     for split in ["train", "validation", "test", "unassigned"]:
         if split_counts[split]:
             lines.append(f"    {split}: {split_counts[split]}")
+    transcript_count = sum(row.get("has_transcript") == "True" for row in rows)
+    lines.append(f"  transcripts found: {transcript_count}/{len(rows)}")
     lines.append("  consensus label counts:")
     for label, count in consensus_counts.most_common():
         lines.append(f"    {label}: {count}")
@@ -552,7 +609,7 @@ def parse_args() -> argparse.Namespace:
         "--raw-dir",
         type=Path,
         default=Path("data/raw/msp_podcast"),
-        help="Directory containing Labels.txt, Partitions.txt/Partition.txt, Speaker_ids.txt, and Audio/.",
+        help="Directory containing Labels.txt, Partitions.txt/Partition.txt, Speaker_ids.txt, optional Transcripts.txt, and Audio/ or Audios/.",
     )
     parser.add_argument(
         "--out-dir",
@@ -579,10 +636,16 @@ def parse_args() -> argparse.Namespace:
         help="Explicit path to Speaker_ids.txt. If omitted, common names are searched in --raw-dir; optional.",
     )
     parser.add_argument(
+        "--transcripts-file",
+        type=Path,
+        default=None,
+        help="Explicit path to Transcripts.txt. If omitted, common names are searched in --raw-dir; optional.",
+    )
+    parser.add_argument(
         "--audio-dir",
         type=Path,
         default=None,
-        help="Explicit audio directory. Defaults to --raw-dir/Audio.",
+        help="Explicit audio directory. Defaults to --raw-dir/Audio, falling back to --raw-dir/Audios if present.",
     )
     parser.add_argument(
         "--strict-audio",
@@ -596,7 +659,14 @@ def main() -> int:
     args = parse_args()
     raw_dir: Path = args.raw_dir
     out_dir: Path = args.out_dir
-    audio_dir: Path = args.audio_dir if args.audio_dir is not None else raw_dir / "Audio"
+    if args.audio_dir is not None:
+        audio_dir: Path = args.audio_dir
+    elif (raw_dir / "Audio").exists():
+        audio_dir = raw_dir / "Audio"
+    elif (raw_dir / "Audios").exists():
+        audio_dir = raw_dir / "Audios"
+    else:
+        audio_dir = raw_dir / "Audio"
 
     try:
         labels_path = args.labels_file or find_first_existing(
@@ -611,6 +681,11 @@ def main() -> int:
             ["Speaker_ids.txt", "speaker_ids.txt", "Speaker_Ids.txt"],
             required=False,
         )
+        transcripts_path = args.transcripts_file or find_first_existing(
+            raw_dir,
+            ["Transcripts.txt", "transcripts.txt", "Transcript.txt", "transcript.txt"],
+            required=False,
+        )
 
         assert labels_path is not None
         assert partitions_path is not None
@@ -618,12 +693,14 @@ def main() -> int:
         label_records = parse_labels_file(labels_path)
         partition_map = parse_partitions_file(partitions_path)
         filename_to_speaker, speaker_meta = parse_speaker_file(speaker_path)
+        transcript_map = parse_transcripts_file(transcripts_path)
         rows = build_manifest_rows(
             label_records=label_records,
             partition_map=partition_map,
             filename_to_speaker=filename_to_speaker,
             speaker_meta=speaker_meta,
             audio_dir=audio_dir,
+            transcript_map=transcript_map,
             strict_audio=args.strict_audio,
         )
 
@@ -647,7 +724,18 @@ def main() -> int:
                 file=sys.stderr,
             )
 
-        write_schema(out_dir / "label_schema.json", labels_path, partitions_path, speaker_path)
+        transcript_without_labels = sorted(set(transcript_map.keys()) - label_filenames)
+        if transcript_without_labels:
+            (out_dir / "transcripts_without_labels.txt").write_text(
+                "\n".join(transcript_without_labels) + "\n", encoding="utf-8"
+            )
+            print(
+                f"Warning: {len(transcript_without_labels)} transcript entries had no label block. "
+                f"Wrote {out_dir / 'transcripts_without_labels.txt'}",
+                file=sys.stderr,
+            )
+
+        write_schema(out_dir / "label_schema.json", labels_path, partitions_path, speaker_path, transcripts_path)
         print(summarize(rows))
         print(f"\nWrote manifests to: {out_dir}")
         return 0
