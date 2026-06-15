@@ -14,6 +14,9 @@ dependencies:
   - transformers
   - nbstripout
   - ffmpeg
+  - huggingface_hub
+  - hf-xet
+  - pyarrow
   - pip
   - pip:
       - torch
