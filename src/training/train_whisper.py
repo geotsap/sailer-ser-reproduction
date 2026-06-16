@@ -7,17 +7,18 @@ pre-extracted Whisper-Large-v3 features και KL Divergence loss.
 Χρήση στο Colab:
     !python src/training/train_whisper.py \
         --hf_dataset_path  /content/drive/MyDrive/SLP/msp_podcast_hf \
-        --whisper_feat_dir /content/drive/MyDrive/SLP/features/whisper-large-v3 \
+        --whisper_feat_dir /content/drive/MyDrive/SLP/features/whisper_shards \
         --output_dir       /content/drive/MyDrive/SLP/checkpoints/whisper \
-        --epochs           20 \
+        --epochs           15 \
         --batch_size       32 \
-        --lr               1e-4
+        --lr               5e-4
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import random
 import sys
 from pathlib import Path
@@ -33,7 +34,7 @@ from tqdm import tqdm
 # Προσθέτουμε το root directory στο path
 sys.path.append(str(Path(__file__).parents[2]))
 
-from src.dataset_features import FeatureDataset, EMOTION_COLS
+from src.dataset_features import ShardFeatureDataset, EMOTION_COLS
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +142,7 @@ def evaluate(
     model.eval()
     all_preds, all_targets = [], []
     total_loss = 0.0
+    num_batches = 0
 
     with torch.no_grad():
         for batch in loader:
@@ -152,13 +154,14 @@ def evaluate(
             logits = model(features, lengths)
             loss   = kl_divergence_loss(logits, soft_labels)
             total_loss += loss.item()
+            num_batches += 1
 
             preds = logits.argmax(dim=-1).cpu().numpy()
             all_preds.extend(preds.tolist())
             all_targets.extend(hard_labels.numpy().tolist())
 
     macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
-    avg_loss  = total_loss / max(len(loader), 1)
+    avg_loss  = total_loss / max(num_batches, 1)
 
     if verbose:
         print(classification_report(
@@ -183,36 +186,37 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] Device: {device}")
 
-    # ── Datasets ─────────────────────────────────────────────────────────────
-    feature_dirs = {"whisper": args.whisper_feat_dir}
-
-    train_ds = FeatureDataset(
+    # ── Datasets (streaming από τα shards) ───────────────────────────────────
+    train_ds = ShardFeatureDataset(
         hf_dataset_path=args.hf_dataset_path,
-        feature_dirs=feature_dirs,
+        shard_dir=args.whisper_feat_dir,
         split="train",
     )
-    val_ds = FeatureDataset(
+    val_ds = ShardFeatureDataset(
         hf_dataset_path=args.hf_dataset_path,
-        feature_dirs=feature_dirs,
+        shard_dir=args.whisper_feat_dir,
         split="validation",
     )
 
+    # ΠΡΟΣΟΧΗ: με IterableDataset ΔΕΝ βάζουμε shuffle=True (το shuffle γίνεται
+    # μέσα στο dataset). Επίσης num_workers=0 για να μη διπλασιάζονται samples.
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
-        collate_fn=FeatureDataset.collate_fn,
+        collate_fn=ShardFeatureDataset.collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
-        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
-        collate_fn=FeatureDataset.collate_fn,
+        collate_fn=ShardFeatureDataset.collate_fn,
     )
+
+    # Πόσα batches περίπου ανά epoch (για το tqdm / μέσο loss)
+    n_train_steps = math.ceil(len(train_ds) / args.batch_size)
 
     emotion_cols = train_ds.emotion_cols
     num_emotions = len(emotion_cols)
@@ -249,8 +253,10 @@ def train(args: argparse.Namespace) -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
+        num_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}",
+                    total=n_train_steps, leave=False)
         for step, batch in enumerate(pbar):
             features    = batch["whisper"].to(device)
             lengths     = batch["whisper_lengths"].to(device)
@@ -264,16 +270,17 @@ def train(args: argparse.Namespace) -> None:
             optimizer.step()
 
             total_loss += loss.item()
+            num_batches += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
             if (step + 1) % args.log_every == 0:
                 print(
-                    f"  Epoch {epoch} | Step {step+1}/{len(train_loader)} "
+                    f"  Epoch {epoch} | Step {step+1}/{n_train_steps} "
                     f"| Loss: {loss.item():.4f}"
                 )
 
         scheduler.step()
-        avg_train_loss = total_loss / len(train_loader)
+        avg_train_loss = total_loss / max(num_batches, 1)
         current_lr     = scheduler.get_last_lr()[0]
 
         # Validation — verbose (per-class F1) μόνο κάθε 5 epochs
@@ -344,11 +351,12 @@ def parse_args() -> argparse.Namespace:
                         help="Directory with .npy Whisper features (one per utterance)")
     parser.add_argument("--output_dir",       type=str, required=True,
                         help="Where to save checkpoints and training log")
-    parser.add_argument("--epochs",      type=int,   default=20)
+    parser.add_argument("--epochs",      type=int,   default=15)
     parser.add_argument("--batch_size",  type=int,   default=32)
-    parser.add_argument("--lr",          type=float, default=1e-4)
+    parser.add_argument("--lr",          type=float, default=5e-4)
     parser.add_argument("--dropout",     type=float, default=0.1)
-    parser.add_argument("--num_workers", type=int,   default=2)
+    parser.add_argument("--num_workers", type=int,   default=0,
+                        help="0 = ασφαλές για streaming. Δοκίμασε 2 για πιο γρήγορο Drive I/O.")
     parser.add_argument("--log_every",   type=int,   default=50,
                         help="Εκτύπωσε loss κάθε N steps")
     parser.add_argument("--seed",        type=int,   default=42)

@@ -1,22 +1,32 @@
 """
 src/dataset_features.py
 
-PyTorch Dataset που φορτώνει pre-extracted .npy features αντί για raw audio.
+Shard-streaming Dataset για τα pre-extracted Whisper features.
 
-Αντί να τρέχει WavLM/Whisper κάθε φορά, φορτώνει τα αποθηκευμένα
-hidden states από το disk — πολύ πιο γρήγορο για training.
+ΓΙΑΤΙ STREAMING;
+    Τα features είναι ~287 GB αποθηκευμένα σε ~150 shard αρχεία (.npz),
+    το καθένα με ~1000 utterances. Δεν χωράνε στον τοπικό δίσκο του Colab,
+    και δεν μπορούμε να διαβάζουμε τυχαίες γραμμές από κάθε shard (θα έπρεπε
+    να φορτώνουμε ολόκληρο το shard κάθε φορά). Οπότε χρησιμοποιούμε
+    IterableDataset: διαβάζουμε τα shards ΣΕΙΡΙΑΚΑ, ένα-ένα ολόκληρο στη RAM,
+    και ανακατεύουμε (α) τη σειρά των shards, (β) τις γραμμές μέσα στο shard,
+    (γ) ένα buffer για ανάμειξη μεταξύ διαφορετικών shards.
 
-Αναμενόμενη δομή φακέλων:
+ΜΟΡΦΗ SHARD (.npz):
+    feats   : float16  [K, 750, 1280]   ← Whisper-large-v3 last hidden state, 15s
+    utt_ids : <U...     [K]              ← το stem κάθε αρχείου (π.χ. MSP-PODCAST_0001_0008)
+    lengths : int32     [K]              ← πραγματικό μήκος σε frames (για σωστό masking)
+
+ΔΟΜΗ ΦΑΚΕΛΩΝ:
     SLP/
     ├── features/
-    │   ├── whisper-large-v3/     ← ένα .npy ανά utterance [T, 1280]
-    │   └── wavlm-large/          ← ένα .npy ανά utterance [T, 1024]  (προαιρετικό)
-    └── msp_podcast_hf/           ← το HuggingFace dataset (για τα labels)
+    │   └── whisper_shards/      ← shard_0000.npz, shard_0001.npz, ...
+    └── msp_podcast_hf/          ← το HuggingFace dataset (για τα labels)
 """
 
 from __future__ import annotations
 
-import time
+import random
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -24,11 +34,11 @@ import numpy as np
 import torch
 from datasets import load_from_disk
 from torch import Tensor
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants  (ίδια με πριν — μην τα αλλάξεις, οι δείκτες πρέπει να ταιριάζουν)
 # ---------------------------------------------------------------------------
 
 PRIMARY_LABELS: List[str] = [
@@ -57,151 +67,228 @@ MAJOR_EMOTION_TO_IDX: Dict[str, int] = {
 
 EMOTION_COLS: List[str] = PRIMARY_LABELS
 
+# Πόσα frames κρατάμε (15s → 750 frames). Πρέπει να ταιριάζει με το extraction.
+KEEP_FRAMES: int = 750
+
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Label index — υπολογίζεται ΜΙΑ φορά και μοιράζεται μεταξύ των splits
 # ---------------------------------------------------------------------------
 
-class FeatureDataset(Dataset):
+# Module-level cache ώστε το train_ds και το val_ds να μην ξαναφορτώνουν
+# το HF dataset δύο φορές.
+_LABEL_CACHE: Dict[str, dict] = {}
+
+
+def _build_label_index(
+    hf_dataset_path: str | Path,
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    seed: int = 42,
+) -> dict:
     """
-    Dataset που φορτώνει pre-extracted features χωρίς να ελέγχει
-    ύπαρξη αρχείων στο __init__ — αποφεύγει Drive rate limits.
+    Φορτώνει το HF dataset (χωρίς audio), υπολογίζει soft & hard labels για
+    κάθε utterance, και κάνει το ίδιο 80/10/10 split με seed=42 όπως πριν.
+
+    Επιστρέφει dict με:
+        soft   : {utt_id -> np.ndarray[9] float32}
+        hard   : {utt_id -> int}
+        splits : {"train"/"validation"/"test" -> set(utt_id)}
+    """
+    key = str(hf_dataset_path)
+    if key in _LABEL_CACHE:
+        return _LABEL_CACHE[key]
+
+    print(f"[labels] Φόρτωση labels από {hf_dataset_path} ...")
+    ds = load_from_disk(key)
+    if hasattr(ds, "keys"):
+        ds = ds["train"]
+    if "audio" in ds.column_names:
+        ds = ds.remove_columns(["audio"])
+
+    # Κρατάμε μόνο τις στήλες που χρειαζόμαστε -> γρήγορο to_pandas
+    needed = ["file", "major_emotion"] + PRIMARY_COLS + \
+             [c for c in OTHER_COLS if c in ds.column_names]
+    needed = [c for c in needed if c in ds.column_names]
+    df = ds.select_columns(needed).to_pandas()
+
+    total = len(df)
+
+    # ── soft labels (vectorized) ─────────────────────────────────────────────
+    primary = df[PRIMARY_COLS].fillna(0.0).to_numpy(dtype=np.float32)        # [N, 8]
+    other_present = [c for c in OTHER_COLS if c in df.columns]
+    if other_present:
+        other = df[other_present].fillna(0.0).to_numpy(dtype=np.float32).sum(axis=1, keepdims=True)
+    else:
+        other = np.zeros((total, 1), dtype=np.float32)
+    soft = np.concatenate([primary, other], axis=1)                          # [N, 9]
+    row_sum = soft.sum(axis=1, keepdims=True)
+    soft = np.where(row_sum > 0, soft / np.clip(row_sum, 1e-8, None),
+                    np.full_like(soft, 1.0 / len(PRIMARY_LABELS)))
+
+    # ── hard labels ──────────────────────────────────────────────────────────
+    hard = (
+        df["major_emotion"].fillna("").str.strip().str.lower()
+        .map(MAJOR_EMOTION_TO_IDX).fillna(8).astype(int).to_numpy()
+    )
+
+    # ── utt_ids ──────────────────────────────────────────────────────────────
+    utt_ids = df["file"].map(lambda f: Path(str(f)).stem).to_numpy()
+
+    soft_map = {uid: soft[i] for i, uid in enumerate(utt_ids)}
+    hard_map = {uid: int(hard[i]) for i, uid in enumerate(utt_ids)}
+
+    # ── 80/10/10 split — ΙΔΙΑ λογική/seed με την προηγούμενη υλοποίηση ────────
+    indices = list(range(total))
+    rng = np.random.default_rng(seed=seed)
+    rng.shuffle(indices)
+    n_train = int(total * train_ratio)
+    n_val   = int(total * val_ratio)
+
+    train_idx = indices[:n_train]
+    val_idx   = indices[n_train : n_train + n_val]
+    test_idx  = indices[n_train + n_val :]
+
+    splits = {
+        "train":      set(utt_ids[i] for i in train_idx),
+        "validation": set(utt_ids[i] for i in val_idx),
+        "test":       set(utt_ids[i] for i in test_idx),
+    }
+    print(f"[labels] total={total} | train={len(splits['train'])} "
+          f"| val={len(splits['validation'])} | test={len(splits['test'])}")
+
+    out = {"soft": soft_map, "hard": hard_map, "splits": splits}
+    _LABEL_CACHE[key] = out
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Streaming Dataset
+# ---------------------------------------------------------------------------
+
+class ShardFeatureDataset(IterableDataset):
+    """
+    Streaming dataset πάνω από τα shard αρχεία.
+
+    Σε κάθε epoch:
+        - (αν shuffle) ανακατεύει τη σειρά των shards
+        - για κάθε shard: το φορτώνει ολόκληρο, κρατάει μόνο τις γραμμές που
+          ανήκουν στο ζητούμενο split, (αν shuffle) ανακατεύει, και τις βάζει
+          σε ένα buffer
+        - όταν το buffer γεμίσει, το ανακατεύει και το αδειάζει (ανάμειξη
+          μεταξύ shards)
     """
 
     def __init__(
         self,
         hf_dataset_path: str | Path,
-        feature_dirs: Dict[str, str | Path],
+        shard_dir: str | Path,
         split: str = "train",
-        train_ratio: float = 0.8,
-        val_ratio: float = 0.1,
+        shuffle: Optional[bool] = None,
+        buffer_size: int = 2000,
         seed: int = 42,
     ) -> None:
-        if not feature_dirs:
-            raise ValueError("Πρέπει να δώσεις τουλάχιστον ένα feature_dir.")
+        super().__init__()
 
-        self.feature_dirs = {k: Path(v) for k, v in feature_dirs.items()}
-        self.split        = split
+        self.shard_dir   = Path(shard_dir)
+        self.split       = "validation" if split in ("val", "dev") else split
+        self.shuffle     = (self.split == "train") if shuffle is None else shuffle
+        self.buffer_size = buffer_size
+        self.seed        = seed
         self.emotion_cols = PRIMARY_LABELS
 
-        # ── Φόρτωσε το HuggingFace dataset (χωρίς audio) ────────────────────
-        print(f"[FeatureDataset] Φόρτωση dataset από {hf_dataset_path} ...")
-        ds = load_from_disk(str(hf_dataset_path))
-        if hasattr(ds, "keys"):
-            ds = ds["train"]
+        # Labels + split assignment (cached)
+        idx = _build_label_index(hf_dataset_path, seed=seed)
+        self.soft_map  = idx["soft"]
+        self.hard_map  = idx["hard"]
+        self.split_ids = idx["splits"][self.split]
 
-        if "audio" in ds.column_names:
-            ds = ds.remove_columns(["audio"])
+        # Λίστα shard αρχείων (τα ανοίγουμε σειριακά -> φιλικό προς το Drive)
+        self.shard_files = sorted(self.shard_dir.glob("shard_*.npz"))
+        if not self.shard_files:
+            raise FileNotFoundError(
+                f"Δεν βρέθηκαν shard_*.npz στο {self.shard_dir}"
+            )
+        print(f"[ShardFeatureDataset] split='{self.split}' | "
+              f"{len(self.shard_files)} shards | {len(self.split_ids)} utterances")
 
-        # ── Manual train/val/test split ──────────────────────────────────────
-        total   = len(ds)
-        indices = list(range(total))
-        rng     = np.random.default_rng(seed=seed)
-        rng.shuffle(indices)
-
-        n_train = int(total * train_ratio)
-        n_val   = int(total * val_ratio)
-
-        if split == "train":
-            split_indices = indices[:n_train]
-        elif split in ("validation", "val", "dev"):
-            split_indices = indices[n_train : n_train + n_val]
-        elif split == "test":
-            split_indices = indices[n_train + n_val :]
-        else:
-            raise ValueError(f"Άγνωστο split: {split!r}. Επίλεξε train/validation/test.")
-
-        self.ds = ds.select(split_indices)
-        print(f"[FeatureDataset] Split '{split}': {len(self.ds)} utterances")
-        print(f"[FeatureDataset] ΔΕΝ ελέγχονται αρχεία κατά την εκκίνηση — lazy loading.")
-
-    # ── Soft label ───────────────────────────────────────────────────────────
-
-    def _get_soft_label(self, sample: dict) -> Tensor:
-        primary_vals = [float(sample.get(col, 0.0) or 0.0) for col in PRIMARY_COLS]
-        other_val = sum(float(sample.get(col, 0.0) or 0.0) for col in OTHER_COLS)
-        values = primary_vals + [other_val]
-        label  = torch.tensor(values, dtype=torch.float32)
-        total = label.sum()
-        if total > 0:
-            label = label / total
-        else:
-            label = torch.ones(len(PRIMARY_LABELS)) / len(PRIMARY_LABELS)
-        return label
-
-    def _get_hard_label(self, sample: dict) -> int:
-        major = (sample.get("major_emotion") or "").strip().lower()
-        return MAJOR_EMOTION_TO_IDX.get(major, 8)
-
-    # ── Feature loading με retry για Drive ───────────────────────────────────
-
-    def _load_features(self, utt_id: str) -> Dict[str, Tensor]:
-        """Φορτώνει features με retry logic για Google Drive I/O errors."""
-        features = {}
-        for encoder_name, feat_dir in self.feature_dirs.items():
-            npy_path = str(feat_dir / f"{utt_id}.npy")
-            arr = None
-            for attempt in range(3):
-                try:
-                    arr = np.load(npy_path)
-                    break
-                except OSError:
-                    if attempt < 2:
-                        time.sleep(1.0 * (attempt + 1))  # 1s, 2s wait
-                    else:
-                        raise  # Αν 3 φορές αποτύχει, σηκώνει error
-            features[encoder_name] = torch.from_numpy(arr)
-        return features
-
-    # ── Public API ───────────────────────────────────────────────────────────
-
+    # Το __len__ βοηθάει το tqdm να ξέρει πόσα samples υπάρχουν
     def __len__(self) -> int:
-        return len(self.ds)
+        return len(self.split_ids)
 
-    def __getitem__(self, idx: int) -> Dict:
-        sample   = self.ds[idx]
-        utt_id   = Path(sample["file"]).stem
-        features = self._load_features(utt_id)
-        soft     = self._get_soft_label(sample)
-        hard     = self._get_hard_label(sample)
+    def _iter_shards(self) -> List[Path]:
+        """Επιστρέφει τα shards για ΤΟΝ ΤΡΕΧΟΝ worker (αποφεύγει διπλά samples
+        όταν num_workers > 0)."""
+        shards = list(self.shard_files)
+        if self.shuffle:
+            random.Random(self.seed + 1).shuffle(shards)  # σταθερό shuffle ανά epoch-start
 
-        return {
-            **features,
-            "soft_label": soft,
-            "hard_label": hard,
-            "utt_id":     utt_id,
-        }
+        info = get_worker_info()
+        if info is not None and info.num_workers > 1:
+            shards = shards[info.id :: info.num_workers]
+        return shards
+
+    def __iter__(self):
+        shards = self._iter_shards()
+        buffer: List[Dict] = []
+
+        for sf in shards:
+            data = np.load(sf)                  # σειριακή ανάγνωση ολόκληρου shard
+            feats = data["feats"]               # [K, 750, 1280] float16
+            uids  = data["utt_ids"]
+            lens  = data["lengths"]
+
+            order = list(range(len(uids)))
+            if self.shuffle:
+                random.shuffle(order)
+
+            for i in order:
+                uid = str(uids[i])
+                if uid not in self.split_ids:
+                    continue
+                item = {
+                    # .copy() ΣΗΜΑΝΤΙΚΟ: αλλιώς κρατάμε view σε όλο το shard (1.9GB)
+                    "whisper":    torch.from_numpy(feats[i].copy()),   # fp16
+                    "length":     int(lens[i]),
+                    "soft_label": torch.from_numpy(self.soft_map[uid].copy()),
+                    "hard_label": self.hard_map[uid],
+                    "utt_id":     uid,
+                }
+                buffer.append(item)
+
+                if len(buffer) >= self.buffer_size:
+                    if self.shuffle:
+                        random.shuffle(buffer)
+                    while buffer:
+                        yield buffer.pop()
+
+            del data, feats  # ελευθέρωσε τη RAM πριν το επόμενο shard
+
+        # flush ό,τι έμεινε
+        if self.shuffle:
+            random.shuffle(buffer)
+        while buffer:
+            yield buffer.pop()
 
     # ── Collate ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def collate_fn(batch: List[Dict]) -> Dict:
-        """Padding και stacking — παραλείπει None items (αποτυχημένα loads)."""
-        # Φιλτράρισμα τυχόν None entries
-        batch = [item for item in batch if item is not None]
-        if len(batch) == 0:
+        batch = [b for b in batch if b is not None]
+        if not batch:
             return None
 
-        output: Dict = {}
+        # Όλα τα features είναι ήδη [750, 1280] -> απλό stack, χωρίς padding.
+        # Μετατροπή σε float32 εδώ (τα conv weights είναι float32).
+        whisper = torch.stack([b["whisper"] for b in batch]).float()        # [B,750,1280]
+        lengths = torch.tensor([b["length"] for b in batch], dtype=torch.long)
+        soft    = torch.stack([b["soft_label"] for b in batch]).float()      # [B,9]
+        hard    = torch.tensor([b["hard_label"] for b in batch], dtype=torch.long)
 
-        encoder_keys = [k for k in batch[0].keys()
-                        if k not in ("soft_label", "hard_label", "utt_id")]
-
-        for key in encoder_keys:
-            tensors = [item[key] for item in batch]
-            lengths = torch.tensor([t.shape[0] for t in tensors], dtype=torch.long)
-            max_len = int(lengths.max().item())
-            D       = tensors[0].shape[1]
-
-            padded = torch.zeros(len(tensors), max_len, D)
-            for i, t in enumerate(tensors):
-                padded[i, : t.shape[0], :] = t
-
-            output[key]              = padded
-            output[f"{key}_lengths"] = lengths
-
-        output["soft_labels"] = torch.stack([item["soft_label"] for item in batch])
-        output["hard_labels"] = torch.tensor([item["hard_label"] for item in batch])
-        output["utt_ids"]     = [item["utt_id"] for item in batch]
-
-        return output
+        return {
+            "whisper":         whisper,
+            "whisper_lengths": lengths,
+            "soft_labels":     soft,
+            "hard_labels":     hard,
+            "utt_ids":         [b["utt_id"] for b in batch],
+        }
