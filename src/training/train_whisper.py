@@ -242,17 +242,37 @@ def train(args: argparse.Namespace) -> None:
         optimizer, T_max=args.epochs
     )
 
-    # ── Training log CSV ─────────────────────────────────────────────────────
-    log_path = output_dir / "training_log.csv"
-    log_fields = ["epoch", "train_loss", "val_loss", "val_macro_f1", "lr"]
-    with open(log_path, "w", newline="") as f:
-        csv.DictWriter(f, fieldnames=log_fields).writeheader()
-
-    # ── Training loop ────────────────────────────────────────────────────────
+    # ── Resume από checkpoint (αν υπάρχει last_model.pt στο output_dir) ──────
+    start_epoch   = 1
     best_macro_f1 = 0.0
     best_epoch    = 0
+    last_ckpt = output_dir / "last_model.pt"
+    if args.resume and last_ckpt.exists():
+        print(f"[resume] Βρέθηκε checkpoint: {last_ckpt}")
+        ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch   = ckpt["epoch"] + 1
+        best_macro_f1 = ckpt.get("best_macro_f1", 0.0)
+        best_epoch    = ckpt.get("best_epoch", 0)
+        print(f"[resume] Συνέχεια από epoch {start_epoch} "
+              f"(καλύτερο μέχρι τώρα: Macro-F1 {best_macro_f1:.4f} @ epoch {best_epoch})")
 
-    for epoch in range(1, args.epochs + 1):
+    # ── Training log CSV (header μόνο σε νέο run· σε resume κρατάμε το παλιό) ─
+    log_path = output_dir / "training_log.csv"
+    log_fields = ["epoch", "train_loss", "val_loss", "val_macro_f1", "lr"]
+    if start_epoch == 1:
+        with open(log_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=log_fields).writeheader()
+
+    # ── Training loop ────────────────────────────────────────────────────────
+    if start_epoch > args.epochs:
+        print(f"[train] Είχε ήδη ολοκληρωθεί ({args.epochs} epochs). "
+              f"Καλύτερο Macro-F1: {best_macro_f1:.4f} (epoch {best_epoch})")
+        return
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         total_loss = 0.0
         num_batches = 0
@@ -307,19 +327,7 @@ def train(args: argparse.Namespace) -> None:
                 "lr":           f"{current_lr:.2e}",
             })
 
-        # ── Αποθήκευση last checkpoint (για resume) ──────────────────────────
-        torch.save({
-            "epoch":               epoch,
-            "model_state_dict":    model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "val_macro_f1":        val_metrics["macro_f1"],
-            "val_loss":            val_metrics["loss"],
-            "emotion_cols":        emotion_cols,
-            "args":                vars(args),
-        }, output_dir / "last_model.pt")
-
-        # ── Αποθήκευση best checkpoint ───────────────────────────────────────
+        # ── Best checkpoint (πρώτα, ώστε το last να κρατήσει το σωστό best) ──
         if val_metrics["macro_f1"] > best_macro_f1:
             best_macro_f1 = val_metrics["macro_f1"]
             best_epoch    = epoch
@@ -334,6 +342,20 @@ def train(args: argparse.Namespace) -> None:
                 "args":                vars(args),
             }, output_dir / "best_model.pt")
             print(f"  ✓ Νέο καλύτερο μοντέλο! Macro-F1: {best_macro_f1:.4f} → best_model.pt")
+
+        # ── Last checkpoint (για resume — κρατά και το τρέχον best) ──────────
+        torch.save({
+            "epoch":               epoch,
+            "model_state_dict":    model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "val_macro_f1":        val_metrics["macro_f1"],
+            "val_loss":            val_metrics["loss"],
+            "best_macro_f1":       best_macro_f1,
+            "best_epoch":          best_epoch,
+            "emotion_cols":        emotion_cols,
+            "args":                vars(args),
+        }, output_dir / "last_model.pt")
 
     print(f"\n[train] Ολοκληρώθηκε! Καλύτερο Macro-F1: {best_macro_f1:.4f} (epoch {best_epoch})")
     print(f"[train] Training log: {log_path}")
@@ -350,7 +372,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf_dataset_path",  type=str, required=True,
                         help="Path to the HuggingFace dataset (save_to_disk format)")
     parser.add_argument("--whisper_feat_dir", type=str, required=True,
-                        help="Directory with .npy Whisper features (one per utterance)")
+                        help="Directory με τα shard_*.npz (pre-extracted Whisper features)")
     parser.add_argument("--output_dir",       type=str, required=True,
                         help="Where to save checkpoints and training log")
     parser.add_argument("--split_mode",  type=str,   default="podcast",
@@ -366,6 +388,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_every",   type=int,   default=50,
                         help="Εκτύπωσε loss κάθε N steps")
     parser.add_argument("--seed",        type=int,   default=42)
+    parser.add_argument("--no_resume",   dest="resume", action="store_false",
+                        help="Ξεκίνα από την αρχή, αγνοώντας τυχόν last_model.pt")
+    parser.set_defaults(resume=True)
     return parser.parse_args()
 
 
