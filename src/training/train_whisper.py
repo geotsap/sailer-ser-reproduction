@@ -225,6 +225,24 @@ def train(args: argparse.Namespace) -> None:
     print(f"[train] Train: {len(train_ds)} | Val: {len(val_ds)}")
     print(f"[train] Emotion classes ({num_emotions}): {emotion_cols}")
 
+    # ── Distribution re-weighting (SAILER §2.4) ──────────────────────────────
+    # q = εμπειρική κατανομή κλάσεων (μέσος όρος των soft labels του TRAIN set)
+    # w = 1/q  → ανεβάζει το βάρος των σπάνιων κλάσεων.
+    # Εφαρμόζεται ΜΟΝΟ στα training targets, ΠΟΤΕ στο validation (όπως το paper).
+    class_weights = None
+    if args.reweight:
+        q = np.zeros(num_emotions, dtype=np.float64)
+        for uid in train_ds.split_ids:
+            q += train_ds.soft_map[uid]
+        q /= max(len(train_ds.split_ids), 1)          # μέση κατανομή, sum≈1
+        w = 1.0 / (q + 1e-6)
+        w = w / w.sum()                                # normalize (paper: sum=1)
+        class_weights = torch.tensor(w, dtype=torch.float32, device=device)
+        print(f"[reweight] q (κατανομη): "
+              f"{ {c: round(float(v), 4) for c, v in zip(emotion_cols, q)} }")
+        print(f"[reweight] w (βαρη):     "
+              f"{ {c: round(float(v), 4) for c, v in zip(emotion_cols, w)} }")
+
     # ── Model ────────────────────────────────────────────────────────────────
     model = WhisperEmotionClassifier(
         input_dim=1280,
@@ -283,6 +301,11 @@ def train(args: argparse.Namespace) -> None:
             features    = batch["whisper"].to(device)
             lengths     = batch["whisper_lengths"].to(device)
             soft_labels = batch["soft_labels"].to(device)
+
+            # Re-weighting: dˆ' = normalize(dˆ ∘ w)  — μόνο στο training
+            if class_weights is not None:
+                soft_labels = soft_labels * class_weights
+                soft_labels = soft_labels / soft_labels.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
             optimizer.zero_grad()
             logits = model(features, lengths)
@@ -390,6 +413,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed",        type=int,   default=42)
     parser.add_argument("--no_resume",   dest="resume", action="store_false",
                         help="Ξεκίνα από την αρχή, αγνοώντας τυχόν last_model.pt")
+    parser.add_argument("--reweight",    action="store_true",
+                        help="Distribution re-weighting (SAILER §2.4) για το imbalance")
     parser.set_defaults(resume=True)
     return parser.parse_args()
 
