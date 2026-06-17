@@ -191,11 +191,13 @@ def train(args: argparse.Namespace) -> None:
         hf_dataset_path=args.hf_dataset_path,
         shard_dir=args.whisper_feat_dir,
         split="train",
+        split_mode=args.split_mode,
     )
     val_ds = ShardFeatureDataset(
         hf_dataset_path=args.hf_dataset_path,
         shard_dir=args.whisper_feat_dir,
         split="validation",
+        split_mode=args.split_mode,
     )
 
     # ΠΡΟΣΟΧΗ: με IterableDataset ΔΕΝ βάζουμε shuffle=True (το shuffle γίνεται
@@ -351,6 +353,10 @@ def parse_args() -> argparse.Namespace:
                         help="Directory with .npy Whisper features (one per utterance)")
     parser.add_argument("--output_dir",       type=str, required=True,
                         help="Where to save checkpoints and training log")
+    parser.add_argument("--split_mode",  type=str,   default="podcast",
+                        choices=["podcast", "random"],
+                        help="'podcast' = grouped, χωρίς leakage (κύριο νούμερο). "
+                             "'random' = τυχαίο, αισιόδοξο (μόνο για σύγκριση).")
     parser.add_argument("--epochs",      type=int,   default=15)
     parser.add_argument("--batch_size",  type=int,   default=32)
     parser.add_argument("--lr",          type=float, default=5e-4)

@@ -82,20 +82,28 @@ _LABEL_CACHE: Dict[str, dict] = {}
 
 def _build_label_index(
     hf_dataset_path: str | Path,
+    split_mode: str = "podcast",
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     seed: int = 42,
 ) -> dict:
     """
     Φορτώνει το HF dataset (χωρίς audio), υπολογίζει soft & hard labels για
-    κάθε utterance, και κάνει το ίδιο 80/10/10 split με seed=42 όπως πριν.
+    κάθε utterance, και κάνει 80/10/10 split.
+
+    split_mode:
+        "podcast" → ομαδοποιημένο ανά podcast id (το ΙΔΙΟ podcast δεν εμφανίζεται
+                    σε δύο splits). Αποφεύγει speaker leakage — αξιόπιστο νούμερο.
+        "random"  → καθαρά τυχαίο 80/10/10 (έχει leakage, αισιόδοξο — μόνο για
+                    σύγκριση/αναφορά).
 
     Επιστρέφει dict με:
         soft   : {utt_id -> np.ndarray[9] float32}
         hard   : {utt_id -> int}
         splits : {"train"/"validation"/"test" -> set(utt_id)}
     """
-    key = str(hf_dataset_path)
+    # Το cache key περιλαμβάνει mode+seed ώστε podcast/random να μη μπερδεύονται
+    key = f"{hf_dataset_path}::{split_mode}::{seed}"
     if key in _LABEL_CACHE:
         return _LABEL_CACHE[key]
 
@@ -138,22 +146,52 @@ def _build_label_index(
     soft_map = {uid: soft[i] for i, uid in enumerate(utt_ids)}
     hard_map = {uid: int(hard[i]) for i, uid in enumerate(utt_ids)}
 
-    # ── 80/10/10 split — ΙΔΙΑ λογική/seed με την προηγούμενη υλοποίηση ────────
-    indices = list(range(total))
+    # ── 80/10/10 split ───────────────────────────────────────────────────────
     rng = np.random.default_rng(seed=seed)
-    rng.shuffle(indices)
-    n_train = int(total * train_ratio)
-    n_val   = int(total * val_ratio)
 
-    train_idx = indices[:n_train]
-    val_idx   = indices[n_train : n_train + n_val]
-    test_idx  = indices[n_train + n_val :]
+    if split_mode == "random":
+        # Καθαρά τυχαίο (έχει speaker leakage — μόνο για σύγκριση)
+        indices = list(range(total))
+        rng.shuffle(indices)
+        n_train = int(total * train_ratio)
+        n_val   = int(total * val_ratio)
+        train_ids = set(utt_ids[i] for i in indices[:n_train])
+        val_ids   = set(utt_ids[i] for i in indices[n_train : n_train + n_val])
+        test_ids  = set(utt_ids[i] for i in indices[n_train + n_val :])
 
-    splits = {
-        "train":      set(utt_ids[i] for i in train_idx),
-        "validation": set(utt_ids[i] for i in val_idx),
-        "test":       set(utt_ids[i] for i in test_idx),
-    }
+    elif split_mode == "podcast":
+        # Ομαδοποίηση ανά podcast id (το μεσαίο πεδίο του ονόματος:
+        # MSP-PODCAST_<podcast>_<segment>). Ολόκληρο το podcast πάει σε ΕΝΑ split,
+        # ώστε ίδιοι ομιλητές να μην μοιράζονται μεταξύ train/val/test.
+        from collections import defaultdict
+        groups: Dict[str, List[str]] = defaultdict(list)
+        for uid in utt_ids:
+            parts = uid.split("_")
+            pid = parts[-2] if len(parts) >= 2 else uid   # podcast id
+            groups[pid].append(uid)
+
+        pids = list(groups.keys())
+        rng.shuffle(pids)
+
+        n_train = total * train_ratio
+        n_val   = total * val_ratio
+        train_ids, val_ids, test_ids = set(), set(), set()
+        seen = 0
+        for pid in pids:
+            members = groups[pid]
+            if seen < n_train:                       # γέμισε πρώτα το train
+                train_ids.update(members)
+            elif seen < n_train + n_val:             # μετά το val
+                val_ids.update(members)
+            else:                                    # ό,τι μένει -> test
+                test_ids.update(members)
+            seen += len(members)
+        print(f"[labels] split_mode='podcast' | {len(pids)} μοναδικά podcasts")
+
+    else:
+        raise ValueError(f"Άγνωστο split_mode: {split_mode!r} (podcast/random)")
+
+    splits = {"train": train_ids, "validation": val_ids, "test": test_ids}
     print(f"[labels] total={total} | train={len(splits['train'])} "
           f"| val={len(splits['validation'])} | test={len(splits['test'])}")
 
@@ -184,6 +222,7 @@ class ShardFeatureDataset(IterableDataset):
         hf_dataset_path: str | Path,
         shard_dir: str | Path,
         split: str = "train",
+        split_mode: str = "podcast",
         shuffle: Optional[bool] = None,
         buffer_size: int = 2000,
         seed: int = 42,
@@ -198,7 +237,7 @@ class ShardFeatureDataset(IterableDataset):
         self.emotion_cols = PRIMARY_LABELS
 
         # Labels + split assignment (cached)
-        idx = _build_label_index(hf_dataset_path, seed=seed)
+        idx = _build_label_index(hf_dataset_path, split_mode=split_mode, seed=seed)
         self.soft_map  = idx["soft"]
         self.hard_map  = idx["hard"]
         self.split_ids = idx["splits"][self.split]
@@ -217,15 +256,22 @@ class ShardFeatureDataset(IterableDataset):
         return len(self.split_ids)
 
     def _iter_shards(self) -> List[Path]:
-        """Επιστρέφει τα shards για ΤΟΝ ΤΡΕΧΟΝ worker (αποφεύγει διπλά samples
-        όταν num_workers > 0)."""
-        shards = list(self.shard_files)
-        if self.shuffle:
-            random.Random(self.seed + 1).shuffle(shards)  # σταθερό shuffle ανά epoch-start
+        """Επιστρέφει τα shards για ΤΟΝ ΤΡΕΧΟΝ worker, σε σωστή σειρά.
 
+        ΣΗΜΑΝΤΙΚΟ: ο διαμοιρασμός στους workers γίνεται ΠΡΩΤΑ (ντετερμινιστικά
+        πάνω στη sorted λίστα) ώστε κάθε worker να πάρει ΞΕΧΩΡΙΣΤΑ shards — αλλιώς
+        με num_workers>1 κάποια shards θα διαβάζονταν διπλά και άλλα καθόλου.
+        Το shuffle γίνεται ΜΕΤΑ, με το global RNG (seeded από set_seed), οπότε η
+        σειρά αλλάζει ανά epoch αλλά παραμένει reproducible."""
+        # 1) ντετερμινιστικός διαμοιρασμός στους workers
+        shards = list(self.shard_files)
         info = get_worker_info()
         if info is not None and info.num_workers > 1:
             shards = shards[info.id :: info.num_workers]
+
+        # 2) shuffle σειράς shards (διαφορετική ανά epoch)
+        if self.shuffle:
+            random.shuffle(shards)
         return shards
 
     def __iter__(self):
