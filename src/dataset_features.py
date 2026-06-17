@@ -108,7 +108,7 @@ def _build_label_index(
         return _LABEL_CACHE[key]
 
     print(f"[labels] Φόρτωση labels από {hf_dataset_path} ...")
-    ds = load_from_disk(key)
+    ds = load_from_disk(str(hf_dataset_path))
     if hasattr(ds, "keys"):
         ds = ds["train"]
     if "audio" in ds.column_names:
