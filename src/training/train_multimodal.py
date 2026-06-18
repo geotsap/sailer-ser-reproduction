@@ -2,7 +2,9 @@
 src/training/train_multimodal.py
 
 Training script για multimodal Speech Emotion Recognition με
-Whisper + RoBERTa features και KL Divergence loss.
+pre-extracted Whisper + RoBERTa features και KL Divergence loss.
+
+Βασισμένο ακριβώς στο train_whisper.py — μόνο οι multimodal αλλαγές.
 
 Χρήση στο Colab:
     !python src/training/train_multimodal.py \
@@ -10,15 +12,16 @@ Whisper + RoBERTa features και KL Divergence loss.
         --shard_dir        /content/drive/MyDrive/SLP/features/whisper_shards \
         --roberta_dir      /content/drive/MyDrive/SLP/features/roberta-large \
         --output_dir       /content/drive/MyDrive/SLP/checkpoints/multimodal \
-        --epochs           20 \
+        --epochs           15 \
         --batch_size       32 \
-        --lr               1e-4
+        --lr               5e-4
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import random
 import sys
 from pathlib import Path
@@ -53,7 +56,10 @@ def set_seed(seed: int) -> None:
 # ---------------------------------------------------------------------------
 
 def kl_divergence_loss(logits: torch.Tensor, soft_labels: torch.Tensor) -> torch.Tensor:
-    """KL Divergence loss όπως στο SAILER paper."""
+    """
+    KL Divergence loss μεταξύ predicted distribution και soft labels.
+    Όπως στο SAILER paper: KL(soft_labels || predicted)
+    """
     log_probs = F.log_softmax(logits, dim=-1)
     return F.kl_div(log_probs, soft_labels, reduction="batchmean")
 
@@ -72,7 +78,8 @@ def evaluate(
     """Υπολογίζει Macro-F1, loss, και per-class F1 στο validation/test set."""
     model.eval()
     all_preds, all_targets = [], []
-    total_loss = 0.0
+    total_loss  = 0.0
+    num_batches = 0
 
     with torch.no_grad():
         for batch in loader:
@@ -83,9 +90,9 @@ def evaluate(
             roberta     = batch["roberta"].unsqueeze(1).to(device)  # [B, 1024] -> [B, 1, 1024]
             soft_labels = batch["soft_labels"].to(device)
             hard_labels = batch["hard_labels"]
+            lengths     = batch["whisper_lengths"]
 
             # speech_mask από lengths
-            lengths = batch["whisper_lengths"]
             B, T, _ = whisper.shape
             speech_mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1).to(device)
 
@@ -94,16 +101,16 @@ def evaluate(
                 roberta_hidden_states=roberta,
                 speech_mask=speech_mask,
             )
-
             loss = kl_divergence_loss(logits, soft_labels)
-            total_loss += loss.item()
+            total_loss  += loss.item()
+            num_batches += 1
 
             preds = logits.argmax(dim=-1).cpu().numpy()
             all_preds.extend(preds.tolist())
             all_targets.extend(hard_labels.numpy().tolist())
 
     macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
-    avg_loss  = total_loss / max(len(loader), 1)
+    avg_loss  = total_loss / max(num_batches, 1)
 
     if verbose:
         print(classification_report(
@@ -128,7 +135,7 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train_multimodal] Device: {device}")
 
-    # ── Datasets ─────────────────────────────────────────────────────────────
+    # ── Datasets (streaming από τα shards + RoBERTa .npy) ────────────────────
     train_ds = MultimodalShardDataset(
         hf_dataset_path=args.hf_dataset_path,
         shard_dir=args.shard_dir,
@@ -146,6 +153,8 @@ def train(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
 
+    # ΠΡΟΣΟΧΗ: με IterableDataset ΔΕΝ βάζουμε shuffle=True (το shuffle γίνεται
+    # μέσα στο dataset). num_workers=0 ασφαλές για streaming.
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -161,10 +170,28 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=MultimodalShardDataset.collate_fn,
     )
 
+    # Πόσα batches περίπου ανά epoch (για το tqdm / μέσο loss)
+    n_train_steps = math.ceil(len(train_ds) / args.batch_size)
+
     emotion_cols = train_ds.emotion_cols
     num_emotions = len(emotion_cols)
     print(f"[train_multimodal] Train: {len(train_ds)} | Val: {len(val_ds)}")
     print(f"[train_multimodal] Emotion classes ({num_emotions}): {emotion_cols}")
+
+    # ── Distribution re-weighting (SAILER §2.4) ──────────────────────────────
+    class_weights = None
+    if args.reweight:
+        q = np.zeros(num_emotions, dtype=np.float64)
+        for uid in train_ds.split_ids:
+            q += train_ds.soft_map[uid]
+        q /= max(len(train_ds.split_ids), 1)
+        w = 1.0 / (q + 1e-6)
+        w = w / w.sum()
+        class_weights = torch.tensor(w, dtype=torch.float32, device=device)
+        print(f"[reweight] q (κατανομη): "
+              f"{ {c: round(float(v), 4) for c, v in zip(emotion_cols, q)} }")
+        print(f"[reweight] w (βαρη):     "
+              f"{ {c: round(float(v), 4) for c, v in zip(emotion_cols, w)} }")
 
     # ── Model ────────────────────────────────────────────────────────────────
     model = WhisperRobertaEmotionModel(
@@ -185,34 +212,60 @@ def train(args: argparse.Namespace) -> None:
         optimizer, T_max=args.epochs
     )
 
+    # ── Resume από checkpoint (αν υπάρχει last_model.pt στο output_dir) ──────
+    start_epoch   = 1
+    best_macro_f1 = 0.0
+    best_epoch    = 0
+    last_ckpt = output_dir / "last_model.pt"
+    if args.resume and last_ckpt.exists():
+        print(f"[resume] Βρέθηκε checkpoint: {last_ckpt}")
+        ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch   = ckpt["epoch"] + 1
+        best_macro_f1 = ckpt.get("best_macro_f1", 0.0)
+        best_epoch    = ckpt.get("best_epoch", 0)
+        print(f"[resume] Συνέχεια από epoch {start_epoch} "
+              f"(καλύτερο μέχρι τώρα: Macro-F1 {best_macro_f1:.4f} @ epoch {best_epoch})")
+
     # ── Training log CSV ─────────────────────────────────────────────────────
     log_path   = output_dir / "training_log.csv"
     log_fields = ["epoch", "train_loss", "val_loss", "val_macro_f1", "lr"]
-    with open(log_path, "w", newline="") as f:
-        csv.DictWriter(f, fieldnames=log_fields).writeheader()
+    if start_epoch == 1:
+        with open(log_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=log_fields).writeheader()
 
     # ── Training loop ────────────────────────────────────────────────────────
-    best_macro_f1 = 0.0
-    best_epoch    = 0
+    if start_epoch > args.epochs:
+        print(f"[train_multimodal] Είχε ήδη ολοκληρωθεί ({args.epochs} epochs). "
+              f"Καλύτερο Macro-F1: {best_macro_f1:.4f} (epoch {best_epoch})")
+        return
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        total_loss = 0.0
+        total_loss  = 0.0
         num_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}",
+                    total=n_train_steps, leave=False)
         for step, batch in enumerate(pbar):
             if batch is None:
                 continue
 
-            whisper     = batch["whisper"].to(device)       # [B, 750, 1280]
-            roberta     = batch["roberta"].unsqueeze(1).to(device)  # [B, 1, 1024]
-            soft_labels = batch["soft_labels"].to(device)   # [B, 9]
+            whisper     = batch["whisper"].to(device)
+            roberta     = batch["roberta"].unsqueeze(1).to(device)  # [B, 1024] -> [B, 1, 1024]
+            soft_labels = batch["soft_labels"].to(device)
             lengths     = batch["whisper_lengths"]
 
             # speech_mask από lengths
             B, T, _ = whisper.shape
             speech_mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1).to(device)
+
+            # Re-weighting — μόνο στο training
+            if class_weights is not None:
+                soft_labels = soft_labels * class_weights
+                soft_labels = soft_labels / soft_labels.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
             optimizer.zero_grad()
             logits = model(
@@ -231,7 +284,7 @@ def train(args: argparse.Namespace) -> None:
 
             if (step + 1) % args.log_every == 0:
                 print(
-                    f"  Epoch {epoch} | Step {step+1} "
+                    f"  Epoch {epoch} | Step {step+1}/{n_train_steps} "
                     f"| Loss: {loss.item():.4f}"
                 )
 
@@ -261,19 +314,7 @@ def train(args: argparse.Namespace) -> None:
                 "lr":           f"{current_lr:.2e}",
             })
 
-        # ── Αποθήκευση last checkpoint ───────────────────────────────────────
-        torch.save({
-            "epoch":                epoch,
-            "model_state_dict":     model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "val_macro_f1":         val_metrics["macro_f1"],
-            "val_loss":             val_metrics["loss"],
-            "emotion_cols":         emotion_cols,
-            "args":                 vars(args),
-        }, output_dir / "last_model.pt")
-
-        # ── Αποθήκευση best checkpoint ───────────────────────────────────────
+        # ── Best checkpoint ───────────────────────────────────────────────────
         if val_metrics["macro_f1"] > best_macro_f1:
             best_macro_f1 = val_metrics["macro_f1"]
             best_epoch    = epoch
@@ -288,6 +329,20 @@ def train(args: argparse.Namespace) -> None:
                 "args":                 vars(args),
             }, output_dir / "best_model.pt")
             print(f"  ✓ Νέο καλύτερο μοντέλο! Macro-F1: {best_macro_f1:.4f} → best_model.pt")
+
+        # ── Last checkpoint (για resume) ──────────────────────────────────────
+        torch.save({
+            "epoch":                epoch,
+            "model_state_dict":     model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "val_macro_f1":         val_metrics["macro_f1"],
+            "val_loss":             val_metrics["loss"],
+            "best_macro_f1":        best_macro_f1,
+            "best_epoch":           best_epoch,
+            "emotion_cols":         emotion_cols,
+            "args":                 vars(args),
+        }, output_dir / "last_model.pt")
 
     print(f"\n[train_multimodal] Ολοκληρώθηκε! Καλύτερο Macro-F1: {best_macro_f1:.4f} (epoch {best_epoch})")
     print(f"[train_multimodal] Training log: {log_path}")
@@ -304,20 +359,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf_dataset_path", type=str, required=True,
                         help="Path to the HuggingFace dataset (save_to_disk format)")
     parser.add_argument("--shard_dir",       type=str, required=True,
-                        help="Directory with Whisper shard .npz files")
+                        help="Directory με τα shard_*.npz (pre-extracted Whisper features)")
     parser.add_argument("--roberta_dir",     type=str, required=True,
-                        help="Directory with RoBERTa .npy feature files")
+                        help="Directory με τα .npy RoBERTa features")
     parser.add_argument("--output_dir",      type=str, required=True,
                         help="Where to save checkpoints and training log")
     parser.add_argument("--split_mode",  type=str,   default="podcast",
                         choices=["podcast", "random"])
-    parser.add_argument("--epochs",      type=int,   default=20)
+    parser.add_argument("--epochs",      type=int,   default=15)
     parser.add_argument("--batch_size",  type=int,   default=32)
-    parser.add_argument("--lr",          type=float, default=1e-4)
+    parser.add_argument("--lr",          type=float, default=5e-4)
     parser.add_argument("--dropout",     type=float, default=0.1)
-    parser.add_argument("--num_workers", type=int,   default=2)
+    parser.add_argument("--num_workers", type=int,   default=0,
+                        help="0 = ασφαλές για streaming.")
     parser.add_argument("--log_every",   type=int,   default=50)
     parser.add_argument("--seed",        type=int,   default=42)
+    parser.add_argument("--no_resume",   dest="resume", action="store_false",
+                        help="Ξεκίνα από την αρχή, αγνοώντας τυχόν last_model.pt")
+    parser.add_argument("--reweight",    action="store_true",
+                        help="Distribution re-weighting (SAILER §2.4) για το imbalance")
+    parser.set_defaults(resume=True)
     return parser.parse_args()
 
 
