@@ -114,19 +114,40 @@ class MultimodalShardDataset(IterableDataset):
                 f"Δεν βρέθηκαν shard_*.npz στο {self.shard_dir}"
             )
 
-        # Ελέγχουμε ότι ο RoBERTa φάκελος υπάρχει
-        if not self.roberta_dir.exists():
-            raise FileNotFoundError(
-                f"Δεν βρέθηκε ο φάκελος RoBERTa features: {self.roberta_dir}"
-            )
+        # ── RoBERTa features ────────────────────────────────────────────────
+        # Προτιμάμε ΕΝΑ packed αρχείο (roberta_all.npz με keys embeddings/utt_ids)
+        # -> φορτώνεται μία φορά στη RAM, χωρίς Drive listing 149χιλ. αρχείων.
+        # Το roberta_dir μπορεί να είναι: (α) path στο .npz, ή (β) φάκελος που το
+        # περιέχει, ή (γ) legacy φάκελος με ξεχωριστά .npy (αργό/ασταθές σε Drive).
+        rp = self.roberta_dir
+        if rp.is_dir():
+            cand = rp / "roberta_all.npz"
+            npz_path = cand if cand.exists() else None
+        elif rp.suffix == ".npz" and rp.exists():
+            npz_path = rp
+        else:
+            npz_path = None
 
-        # Μετράμε πόσα RoBERTa αρχεία υπάρχουν για το split
-        roberta_available = {
-            p.stem for p in self.roberta_dir.glob("*.npy")
-        }
+        self.roberta_map = None  # dict utt_id -> np.ndarray (όταn υπάρχει packed)
+        if npz_path is not None:
+            print(f"[MultimodalShardDataset] Φόρτωση RoBERTa από {npz_path.name} ...")
+            data = np.load(str(npz_path))
+            embs = data["embeddings"]            # [N, 1024]
+            uids = data["utt_ids"]
+            self.roberta_map = {str(u): embs[i] for i, u in enumerate(uids)}
+            roberta_available = set(self.roberta_map.keys())
+        else:
+            if not self.roberta_dir.exists():
+                raise FileNotFoundError(
+                    "Δεν βρέθηκαν RoBERTa features: ούτε roberta_all.npz "
+                    f"ούτε φάκελος {self.roberta_dir}"
+                )
+            print("[MultimodalShardDataset] ΠΡΟΣΟΧΗ: legacy per-file .npy mode "
+                  "(αργό/ασταθές σε Drive). Προτιμήστε roberta_all.npz.")
+            roberta_available = {p.stem for p in self.roberta_dir.glob("*.npy")}
+
         split_with_roberta = self.split_ids & roberta_available
         missing = len(self.split_ids) - len(split_with_roberta)
-
         if missing > 0:
             if not skip_missing_roberta:
                 raise FileNotFoundError(
@@ -146,13 +167,13 @@ class MultimodalShardDataset(IterableDataset):
         return len(self.split_ids)
 
     def _load_roberta(self, utt_id: str) -> Tensor:
-        """
-        Φορτώνει το RoBERTa embedding για ένα utterance.
-        Shape εισόδου: [1, 1024] → επιστρέφει [1024] (squeeze).
-        """
-        path = self.roberta_dir / f"{utt_id}.npy"
-        arr  = np.load(str(path))          # [1, 1024]
-        return torch.from_numpy(arr.squeeze(0).copy())  # [1024]
+        """RoBERTa embedding [1024] για ένα utterance (από RAM ή legacy .npy)."""
+        if self.roberta_map is not None:
+            arr = self.roberta_map[utt_id]                 # [1024] (ή [1,1024])
+        else:
+            arr = np.load(str(self.roberta_dir / f"{utt_id}.npy"))
+        arr = np.asarray(arr).reshape(-1)                  # -> [1024]
+        return torch.from_numpy(arr.copy())
 
     def _iter_shards(self) -> List[Path]:
         """Διαμοιράζει τα shards στους workers και ανακατεύει αν χρειάζεται."""
