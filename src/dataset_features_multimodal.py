@@ -50,6 +50,7 @@ from src.dataset_features import (
     KEEP_FRAMES,
     EMOTION_COLS,
 )
+from src.augmentations_features import annotation_dropout
 
 
 class MultimodalShardDataset(IterableDataset):
@@ -89,6 +90,9 @@ class MultimodalShardDataset(IterableDataset):
         buffer_size: int = 2000,
         skip_missing_roberta: bool = True,
         seed: int = 42,
+        annotation_dropout: bool = False,
+        n_annotators: int = 5,
+        drop_rate: float = 0.2,
     ) -> None:
         super().__init__()
 
@@ -100,6 +104,16 @@ class MultimodalShardDataset(IterableDataset):
         self.skip_missing = skip_missing_roberta
         self.seed         = seed
         self.emotion_cols = PRIMARY_LABELS
+
+        # ── Annotation dropout (SAILER §2.3) — ΜΟΝΟ στο train ───────────────
+        self.annotation_dropout = annotation_dropout and (self.split == "train")
+        self.n_annotators = n_annotators
+        self.drop_rate    = drop_rate
+        # ξεχωριστό RNG ώστε να μην επηρεάζει το shuffle· αλλάζει ανά epoch
+        self.aug_rng = np.random.default_rng(seed + 777)
+        if self.annotation_dropout:
+            print(f"[MultimodalShardDataset] Annotation dropout ON "
+                  f"(N={n_annotators}, rate={drop_rate}, μόνο majority)")
 
         # Labels + split assignment (cached — κοινό με ShardFeatureDataset)
         idx = _build_label_index(hf_dataset_path, split_mode=split_mode, seed=seed)
@@ -212,11 +226,21 @@ class MultimodalShardDataset(IterableDataset):
                 except Exception:
                     continue
 
+                # soft label (+ annotation dropout αν είναι ενεργό, μόνο train)
+                if self.annotation_dropout:
+                    soft = annotation_dropout(
+                        self.soft_map[uid], self.aug_rng,
+                        n_annotators=self.n_annotators, drop_rate=self.drop_rate,
+                    )
+                else:
+                    soft = self.soft_map[uid].copy()
+                soft = np.asarray(soft, dtype=np.float32)
+
                 item = {
                     "whisper":    torch.from_numpy(feats[i].copy()),  # [750, 1280] fp16
                     "roberta":    roberta,                             # [1024] fp32
                     "length":     int(lens[i]),
-                    "soft_label": torch.from_numpy(self.soft_map[uid].copy()),
+                    "soft_label": torch.from_numpy(soft),
                     "hard_label": self.hard_map[uid],
                     "utt_id":     uid,
                 }

@@ -143,6 +143,9 @@ def train(args: argparse.Namespace) -> None:
         split="train",
         split_mode=args.split_mode,
         seed=args.seed,
+        annotation_dropout=args.annotation_dropout,
+        n_annotators=args.n_annotators,
+        drop_rate=args.drop_rate,
     )
     val_ds = MultimodalShardDataset(
         hf_dataset_path=args.hf_dataset_path,
@@ -378,6 +381,12 @@ def parse_args() -> argparse.Namespace:
                         help="Ξεκίνα από την αρχή, αγνοώντας τυχόν last_model.pt")
     parser.add_argument("--reweight",    action="store_true",
                         help="Distribution re-weighting (SAILER §2.4) για το imbalance")
+    parser.add_argument("--annotation_dropout", action="store_true",
+                        help="Annotation dropout augmentation (SAILER §2.3, train-only)")
+    parser.add_argument("--n_annotators", type=int, default=5,
+                        help="Υποτιθέμενος αριθμός annotators για τα pseudo-counts")
+    parser.add_argument("--drop_rate",   type=float, default=0.2,
+                        help="Ποσοστό annotations που πέφτουν (από majority κλάσεις)")
     parser.set_defaults(resume=True)
     return parser.parse_args()
 
