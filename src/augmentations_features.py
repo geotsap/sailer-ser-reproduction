@@ -1,86 +1,52 @@
 """
-src/augmentations_features.py
+Feature-space data augmentation για SER (SAILER §4.2 / Πίνακας 3).
 
-Data augmentation για το feature-based pipeline (SAILER §2.3 / Πίνακας 3).
+Υλοποιεί το **annotation dropout**. Επειδή το HF dataset αποθηκεύει τα labels
+ως ΚΑΝΟΝΙΚΟΠΟΙΗΜΕΝΕΣ κατανομές (όχι ακέραιους ψήφους), αναπαριστούμε τους
+ψήφους με "pseudo-counts": c = d * N_annotators.
 
-Επειδή δουλεύουμε με pre-extracted features (όχι raw audio), οι τεχνικές
-υλοποιούνται στον χώρο που έχουμε διαθέσιμο:
+Annotation dropout (πιστό στο paper):
+  1. pseudo-counts c = soft * N            (sum = N)
+  2. αφαιρούμε round(drop_rate * N) ψευδο-ψήφους, ΜΟΝΟ από κυρίαρχες κλάσεις
+     (Angry/Sad/Happy/Neutral), στοχαστικά ανάλογα με τη μάζα τους
+  3. ξανακανονικοποιούμε σε άθροισμα 1
 
-ANNOTATION DROPOUT (SAILER §2.3)
-    Το paper πετάει τυχαία 20% των annotations (ψήφων) κάθε δείγματος, και
-    ΜΟΝΟ από τις κυρίαρχες κλάσεις, ώστε να (α) εισάγει στοχαστικότητα στο soft
-    label ανά epoch και (β) να ανεβάζει σχετικά τη μάζα των μειονοτήτων.
-
-    ΠΡΟΣΟΧΗ (απόκλιση από το paper): το dataset μας δεν κρατά τους αρχικούς
-    ακέραιους ψήφους — μόνο την κανονικοποιημένη κατανομή (sum=1, με ένα μικρό
-    label-smoothing πάτωμα). Οπότε ανακατασκευάζουμε "pseudo-counts":
-        counts ≈ round(soft * N),   N = υποτιθέμενος αριθμός annotators (paper: ≥5)
-    πετάμε ~drop_rate των ψευδο-ψήφων από τις κυρίαρχες κλάσεις, και
-    ξανακανονικοποιούμε σε άθροισμα 1. Ίδια λογική με το paper, προσεγγιστική
-    υλοποίηση λόγω της μορφής των δεδομένων.
+Εφαρμόζεται ΜΟΝΟ στο training.
 """
-
 from __future__ import annotations
-
 import numpy as np
 
-# Σειρά κλάσεων (PRIMARY_LABELS):
-#   0 Angry | 1 Sad | 2 Happy | 3 Surprise | 4 Fear | 5 Disgust | 6 Contempt
-#   7 Neutral | 8 Other
-# Κυρίαρχες κλάσεις κατά SAILER: Neutral, Happy, Sad, Angry
-MAJORITY_IDX = (0, 1, 2, 7)
+# PRIMARY_LABELS = ['Angry','Sad','Happy','Surprise','Fear','Disgust',
+#                   'Contempt','Neutral','Other']
+# Κυρίαρχες κλάσεις: Angry(0), Sad(1), Happy(2), Neutral(7) + Other(8).
+# ΣΗΜΕΙΩΣΗ: το paper ορίζει μόνο Angry/Sad/Happy/Neutral, αλλά στα ΔΙΚΑ ΜΑΣ
+# δεδομένα το 'Other' είναι ~37% (de-facto κυρίαρχο), οπότε το συμπεριλαμβάνουμε
+# ώστε το dropout να μειώνει ΚΑΙ αυτό και να ενισχύει τις πραγματικές μειονότητες.
+MAJORITY_IDX = (0, 1, 2, 7, 8)
 
 
-def _normalize(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=np.float64)
-    s = v.sum()
+def annotation_dropout(soft, rng, n_annotators=5, drop_rate=0.2,
+                       majority_idx=MAJORITY_IDX):
+    """Νέο soft label [C] (float32, sum=1) μετά annotation dropout. Δεν αλλάζει το input."""
+    d = np.asarray(soft, dtype=np.float64).copy()
+    s = d.sum()
     if s <= 0:
-        return np.full_like(v, 1.0 / len(v))
-    return v / s
+        return np.asarray(soft, dtype=np.float32)
+    d /= s
 
+    c = d * n_annotators                       # pseudo-counts, sum = N
+    n_drop = int(round(drop_rate * n_annotators))
+    maj = list(majority_idx)
 
-def annotation_dropout(
-    soft: np.ndarray,
-    rng: np.random.Generator,
-    n_annotators: int = 5,
-    drop_rate: float = 0.2,
-    majority_idx: tuple = MAJORITY_IDX,
-) -> np.ndarray:
-    """
-    Επιστρέφει ΝΕΟ soft label [K] (sum=1) αφού "πετάξει" ~drop_rate των
-    (pseudo-)ψήφων από τις κυρίαρχες κλάσεις.
+    for _ in range(n_drop):
+        avail = np.array([max(c[i], 0.0) for i in maj], dtype=np.float64)
+        if avail.sum() <= 0:                   # καμία κυρίαρχη μάζα -> stop
+            break
+        probs = avail / avail.sum()
+        j = maj[int(rng.choice(len(maj), p=probs))]
+        c[j] = max(c[j] - 1.0, 0.0)            # αφαίρεσε 1 ψευδο-ψήφο
 
-    Δεν τροποποιεί το input. Ντετερμινιστικό δοθέντος του rng.
-    """
-    soft = np.asarray(soft, dtype=np.float64)
-
-    # 1) pseudo-counts (το label-smoothing πάτωμα ~0.003 -> 0 μετά το round)
-    counts = np.rint(soft * n_annotators).astype(int)
-    counts = np.clip(counts, 0, None)
-    total = int(counts.sum())
+    total = c.sum()
     if total <= 0:
-        return _normalize(soft)
-
-    # 2) πόσους ψήφους πετάμε
-    n_drop = int(round(drop_rate * total))
-    if n_drop <= 0:
-        return _normalize(counts.astype(float))
-
-    # 3) pool με τους ψήφους ΜΟΝΟ των κυρίαρχων κλάσεων
-    pool = []
-    for k in majority_idx:
-        pool.extend([k] * int(counts[k]))
-    if not pool:
-        # καθαρά μειονοτικό δείγμα -> δεν πετάμε τίποτα
-        return _normalize(counts.astype(float))
-
-    # 4) πέτα n_drop ψήφους (τυχαία, χωρίς επανατοποθέτηση)
-    n_drop = min(n_drop, len(pool))
-    dropped = rng.choice(np.array(pool), size=n_drop, replace=False)
-    for k in dropped:
-        counts[int(k)] -= 1
-    counts = np.clip(counts, 0, None)
-
-    if counts.sum() <= 0:
-        return _normalize(soft)          # ασφάλεια
-    return _normalize(counts.astype(float))
+        return d.astype(np.float32)
+    return (c / total).astype(np.float32)
