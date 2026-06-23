@@ -109,12 +109,15 @@ def evaluate(
             all_preds.extend(preds.tolist())
             all_targets.extend(hard_labels.numpy().tolist())
 
-    macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
+    labels = list(range(len(emotion_cols)))
+    macro_f1 = f1_score(all_targets, all_preds, labels=labels,
+                        average="macro", zero_division=0)
     avg_loss  = total_loss / max(num_batches, 1)
 
     if verbose:
         print(classification_report(
             all_targets, all_preds,
+            labels=labels,
             target_names=emotion_cols,
             zero_division=0,
         ))
@@ -146,6 +149,7 @@ def train(args: argparse.Namespace) -> None:
         annotation_dropout=args.annotation_dropout,
         n_annotators=args.n_annotators,
         drop_rate=args.drop_rate,
+        drop_other=args.drop_other,
     )
     val_ds = MultimodalShardDataset(
         hf_dataset_path=args.hf_dataset_path,
@@ -154,6 +158,7 @@ def train(args: argparse.Namespace) -> None:
         split="validation",
         split_mode=args.split_mode,
         seed=args.seed,
+        drop_other=args.drop_other,
     )
 
     # ΠΡΟΣΟΧΗ: με IterableDataset ΔΕΝ βάζουμε shuffle=True (το shuffle γίνεται
@@ -379,6 +384,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed",        type=int,   default=42)
     parser.add_argument("--no_resume",   dest="resume", action="store_false",
                         help="Ξεκίνα από την αρχή, αγνοώντας τυχόν last_model.pt")
+    parser.add_argument("--drop_other", action="store_true",
+                        help="8-class mode: πέτα την κλάση 'Other', renormalize στις 8 primary")
     parser.add_argument("--reweight",    action="store_true",
                         help="Distribution re-weighting (SAILER §2.4) για το imbalance")
     parser.add_argument("--annotation_dropout", action="store_true",

@@ -93,6 +93,7 @@ class MultimodalShardDataset(IterableDataset):
         annotation_dropout: bool = False,
         n_annotators: int = 5,
         drop_rate: float = 0.2,
+        drop_other: bool = False,
     ) -> None:
         super().__init__()
 
@@ -103,7 +104,15 @@ class MultimodalShardDataset(IterableDataset):
         self.buffer_size  = buffer_size
         self.skip_missing = skip_missing_roberta
         self.seed         = seed
-        self.emotion_cols = PRIMARY_LABELS
+
+        # 8-class mode: πετάμε την κλάση 'Other', κρατάμε μόνο τις 8 primary
+        self.drop_other   = bool(drop_other)
+        if self.drop_other:
+            self.emotion_cols = PRIMARY_LABELS[:8]    # χωρίς 'Other'
+            self.majority_idx = (0, 1, 2, 7)          # Angry/Sad/Happy/Neutral
+        else:
+            self.emotion_cols = PRIMARY_LABELS
+            self.majority_idx = MAJORITY_IDX
 
         # ── Annotation dropout (SAILER §2.3) — ΜΟΝΟ στο train ───────────────
         self.annotation_dropout = annotation_dropout and (self.split == "train")
@@ -117,9 +126,20 @@ class MultimodalShardDataset(IterableDataset):
 
         # Labels + split assignment (cached — κοινό με ShardFeatureDataset)
         idx = _build_label_index(hf_dataset_path, split_mode=split_mode, seed=seed)
-        self.soft_map  = idx["soft"]
         self.hard_map  = idx["hard"]
         self.split_ids = idx["splits"][self.split]
+
+        if self.drop_other:
+            # Κράτα μόνο τη μάζα των 8 primary και renormalize (πέτα το 'Other').
+            # Έτσι ΟΛΑ τα δείγματα συμμετέχουν με την primary πληροφορία τους.
+            base = idx["soft"]
+            self.soft_map = {}
+            for uid in self.split_ids:
+                v = np.asarray(base[uid][:8], dtype=np.float64)
+                s = float(v.sum())
+                self.soft_map[uid] = (v / s if s > 0 else np.full(8, 1.0 / 8)).astype(np.float32)
+        else:
+            self.soft_map = idx["soft"]
 
         # Λίστα Whisper shard αρχείων
         self.shard_files = sorted(self.shard_dir.glob("shard_*.npz"))
@@ -231,6 +251,7 @@ class MultimodalShardDataset(IterableDataset):
                     soft = annotation_dropout(
                         self.soft_map[uid], self.aug_rng,
                         n_annotators=self.n_annotators, drop_rate=self.drop_rate,
+                        majority_idx=self.majority_idx,
                     )
                 else:
                     soft = self.soft_map[uid].copy()
