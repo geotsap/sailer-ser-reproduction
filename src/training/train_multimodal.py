@@ -150,8 +150,6 @@ def train(args: argparse.Namespace) -> None:
         n_annotators=args.n_annotators,
         drop_rate=args.drop_rate,
         drop_other=args.drop_other,
-        audio_mixing=args.audio_mixing,
-        audio_mix_prob=args.audio_mix_prob,
     )
     val_ds = MultimodalShardDataset(
         hf_dataset_path=args.hf_dataset_path,
@@ -187,8 +185,6 @@ def train(args: argparse.Namespace) -> None:
     num_emotions = len(emotion_cols)
     print(f"[train_multimodal] Train: {len(train_ds)} | Val: {len(val_ds)}")
     print(f"[train_multimodal] Emotion classes ({num_emotions}): {emotion_cols}")
-    if args.audio_mixing:
-        print(f"[train_multimodal] Audio mixing ON (p={args.audio_mix_prob})")
 
     # ── Distribution re-weighting (SAILER §2.4) ──────────────────────────────
     class_weights = None
