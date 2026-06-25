@@ -150,6 +150,8 @@ def train(args: argparse.Namespace) -> None:
         n_annotators=args.n_annotators,
         drop_rate=args.drop_rate,
         drop_other=args.drop_other,
+        audio_mixing=args.audio_mixing,
+        audio_mix_prob=args.audio_mix_prob,
     )
     val_ds = MultimodalShardDataset(
         hf_dataset_path=args.hf_dataset_path,
@@ -185,6 +187,8 @@ def train(args: argparse.Namespace) -> None:
     num_emotions = len(emotion_cols)
     print(f"[train_multimodal] Train: {len(train_ds)} | Val: {len(val_ds)}")
     print(f"[train_multimodal] Emotion classes ({num_emotions}): {emotion_cols}")
+    if args.audio_mixing:
+        print(f"[train_multimodal] Audio mixing ON (p={args.audio_mix_prob})")
 
     # ── Distribution re-weighting (SAILER §2.4) ──────────────────────────────
     class_weights = None
@@ -394,6 +398,10 @@ def parse_args() -> argparse.Namespace:
                         help="Υποτιθέμενος αριθμός annotators για τα pseudo-counts")
     parser.add_argument("--drop_rate",   type=float, default=0.2,
                         help="Ποσοστό annotations που πέφτουν (από majority κλάσεις)")
+    parser.add_argument("--audio_mixing", action="store_true",
+                        help="Feature-space audio mixing (SAILER §2.3 adaptation, train-only)")
+    parser.add_argument("--audio_mix_prob", type=float, default=0.5,
+                        help="Πιθανότητα mixing ανά majority δείγμα")
     parser.set_defaults(resume=True)
     return parser.parse_args()
 
